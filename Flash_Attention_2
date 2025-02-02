@@ -1,0 +1,85 @@
+import math
+import torch
+import torch.nn as nn
+
+x1 = torch.randn(16, 1024)
+x2 = torch.randn(16, 1024)
+torch.manual_seed(42)
+
+def calculate_local_fx(x: torch.Tensor):
+    m = torch.max(x, dim=-1, keepdim=True)[0]
+    fx = torch.exp(x - m)
+    l = torch.sum(fx, dim=-1, keepdim=True)
+    return m, l, fx
+
+def decomposed_softmax(fx1, l1, m1, fx2, l2, m2):
+    mx = torch.max(torch.stack((m1, m2)), dim=0, keepdim=True)
+    lx = torch.exp(m1 - mx) * l1 + torch.exp(m2 - mx) * l2
+    fx = torch.exp(m1 - mx) * fx1 + torch.exp(m2 - mx) * fx2
+    softmax_result = fx / lx
+    return softmax_result
+
+standard_softmax = nn.Softmax(dim=-1)
+standard_softmax_result = standard_softmax(torch.cat((x1,x2), dim=-1))
+m1, l1, fx1 = calculate_local_fx(x1)
+m2, l2, fx2 = calculate_local_fx(x2)
+decomposed_softmax_result = decomposed_softmax(fx1, l1, m1, fx2, m2, l2)
+print(torch.allclose(standard_softmax_result, decomposed_softmax_result, atol=1e-3))
+
+class StdAttentionCord(nn.Module):
+    def __init__(self, attention_head_size):
+        super().__init__()
+        self.softmax_scaling_constant = 1 / math.sqrt(attention_head_size)
+        self.softmax = nn.Softmax(dim=-1)
+        self.where_const = -1e4
+
+    def forward(self, q, k, v):
+        x = torch.matmul(q, k.transpose(-1, -2))
+        b, sq, sk = x.size()
+        x = x * self.softmax_scaling_constant
+        x = self.softmax(x)
+        x = torch.matmul(x, v)
+        return x
+
+class FlashAttentionCore(nn.Module):
+    def __init__(self, attention_head_size, block_size):
+        super().__init__()
+        self.softmax_scaling_constant = 1 / math.sqrt(attention_head_size)
+        self.where_const = -1e4
+        self.block_size = block_size
+
+    def forward(self, q, k, v):
+        num_blocks = q.shape[1] // self.block_size
+        q_list, k_list, v_list = [torch.chunk(tensor, num_blocks, dim=1) for tensor in [q, k, v]]
+        O = [torch.zeros(q_list[0]) for _ in range(num_blocks)]
+        l = [torch.zeros(k_list[0]) for _ in range(num_blocks)]
+        m = [torch.zeros(v_list[0]) for _ in range(num_blocks)]
+        
+        for j in range(num_blocks):
+            for i in range(num_blocks):
+                qi = q_list[i]
+                kj = k_list[j]
+                vj = v_list[j]
+
+                Sij = torch.matmul(qi, kj.transpose(-2, -1)) * self.softmax_scaling_constant
+                m_tilde = torch.max(Sij, dim=-1, keepdim=True).values
+                P_tilde = torch.exp(Sij - m_tilde)
+
+                new_m = torch.max(m[i], m_tilde)
+                new_l = torch.exp(m[i] - new_m) * l[i] + torch.exp(m_tilde - new_m) * torch.sum(P_tilde, dim=-1, keepdim=True)
+                new_O = torch.exp(m[i] - new_m) * O[i] + torch.exp(m_tilde - new_m) * torch.matmul(P_tilde, vj)
+
+                O[i] = new_O
+                l[i] = new_l
+                m[i] = new_m
+        O = torch.cat(O, dim=1)
+        return O
+
+torch.manual_seed(42)
+q, k, v = [torch.rand(8, 512, 768) for _ in range(3)]
+std_attn = StdAttentionCord(q.shape[-1])
+flash_attn = FlashAttentionCore(q.shape[-1], 8)
+
+std_out = std_attn(q, k, v)
+flash_out = flash_attn(q, k, v)
+print(torch.allclose(std_out, flash_out, atol=1e-3))
