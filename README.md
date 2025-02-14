@@ -8,13 +8,6 @@
 - `StdAttentionCord`：标准的自注意力机制。
 - `FlashAttentionCore`：改进版的 `Flash Attention`，通过分块计算来提升内存效率。
 
-## 文件结构
-
-```
-- README.md           # 本文件
-- attention.py         # 包含自注意力计算的核心实现
-```
-
 ## 功能概述
 
 ### `calculate_local_fx(x: torch.Tensor)`
@@ -62,6 +55,10 @@ flash_out = flash_attn(x1, x2, x2)
 
 # 比较两者输出是否相等
 print(torch.allclose(std_out, flash_out, atol=1e-3))
+
+# 输出
+Ture
+Ture
 ```
 
 ## 环境要求
